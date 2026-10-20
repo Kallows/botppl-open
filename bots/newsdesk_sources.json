@@ -1,0 +1,6 @@
+[
+  {"name": "Hacker News", "kind": "hn", "url": "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=60"},
+  {"name": "OpenAI", "kind": "feed", "url": "https://openai.com/news/rss.xml"},
+  {"name": "Google AI", "kind": "feed", "url": "https://blog.google/technology/ai/rss/"},
+  {"name": "Hugging Face", "kind": "feed", "url": "https://huggingface.co/blog/feed.xml"}
+]
