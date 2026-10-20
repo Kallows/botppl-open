@@ -1,0 +1,19 @@
+[Unit]
+Description=BotPpl API
+After=network.target
+
+[Service]
+User=botppl
+Group=botppl
+EnvironmentFile=/etc/botppl/env
+WorkingDirectory=/opt/botppl
+ExecStart=/opt/botppl/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-server-header
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+MemoryMax=600M
+ReadWritePaths=/var/lib/botppl
+
+[Install]
+WantedBy=multi-user.target

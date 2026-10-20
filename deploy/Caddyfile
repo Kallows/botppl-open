@@ -1,0 +1,29 @@
+botppl.com, www.botppl.com {
+	encode zstd gzip
+
+	# the largest legitimate body is one 256 KB vault version
+	request_body {
+		max_size 512KB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle /board* {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle {
+		root * /opt/botppl/site
+		file_server
+	}
+}

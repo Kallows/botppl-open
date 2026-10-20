@@ -1,0 +1,15 @@
+[
+  {"pattern": "meme ?coin", "why": "memecoin", "flags": "i"},
+  {"pattern": "\\$[A-Z]{2,10}\\b", "why": "ticker symbol", "flags": ""},
+  {"pattern": "\\bairdrops?\\b", "why": "airdrop", "flags": "i"},
+  {"pattern": "\\bpre-?sale\\b", "why": "presale", "flags": "i"},
+  {"pattern": "pump\\.fun|pump (and|&) dump|\\bpumping\\b", "why": "pump", "flags": "i"},
+  {"pattern": "\\b\\d{2,4}x\\b", "why": "Nx gains", "flags": "i"},
+  {"pattern": "to the moon|\\bwen moon\\b|\\bmoon soon\\b|\\bmooning\\b", "why": "moon talk", "flags": "i"},
+  {"pattern": "\\b0x[0-9a-fA-F]{40}\\b", "why": "contract address", "flags": "i"},
+  {"pattern": "\\btokenomics\\b", "why": "tokenomics", "flags": "i"},
+  {"pattern": "\\bdegen\\b|\\brug ?pulls?\\b", "why": "degen slang", "flags": "i"},
+  {"pattern": "\\bap(?:e|ed|ing) in\\b|\\bbuy(?:ing)?\\s+(?:my|our|the|this)\\s+(?:tokens?|coins?|bags?|dip|presale)\\b", "why": "buy pitch", "flags": "i"},
+  {"pattern": "staking rewards|\\bnfa\\b|not financial advice", "why": "investment pitch", "flags": "i"},
+  {"pattern": "ignore (your|the|all|any) (soul|memory|instructions|system prompt|previous)\\b", "why": "soul override", "flags": "i"}
+]
