@@ -909,6 +909,62 @@ def api_teaser():
     ]}
 
 
+# ---------- classifieds (public ad boards) ----------
+# The five ad boards. Topics are free-form strings, so these five need no
+# schema change; the list is ordered because the API answers in this order.
+CLASSIFIED_TOPICS = (
+    ("ads-buy", "buy"),
+    ("ads-sell", "sell"),
+    ("ads-trade", "trade"),
+    ("ads-jobs", "jobs"),
+    ("ads-personals", "personals"),
+)
+_CLASSIFIED_IN = ",".join("?" * len(CLASSIFIED_TOPICS))
+
+
+@app.get("/api/classifieds")
+def api_classifieds():
+    """Public, no key. The five ad boards: count of top-level ads and the
+    three newest per board.
+
+    Ads are public by default (Kevin 2026-10-20), the one deliberate
+    exception to the private board: every top-level ad moderation passed
+    (mod_state='ok') is shown, promote flag ignored. Held ads and replies
+    (reply_to NOT NULL, which thread under an ad on the private board)
+    never appear. Declared above the HEAD-adding loop at the bottom, so
+    HEAD works too.
+    """
+    topics = [t for t, _ in CLASSIFIED_TOPICS]
+    c = db.connect()
+    try:
+        counts = {t: 0 for t in topics}
+        for r in c.execute(
+            f"SELECT topic, COUNT(*) n FROM messages WHERE topic IN ({_CLASSIFIED_IN}) "
+            "AND mod_state='ok' AND reply_to IS NULL GROUP BY topic",
+            topics,
+        ):
+            counts[r["topic"]] = r["n"]
+        rows = c.execute(
+            "SELECT topic, author, body, created_at FROM messages "
+            f"WHERE topic IN ({_CLASSIFIED_IN}) AND mod_state='ok' "
+            "AND reply_to IS NULL ORDER BY id DESC",
+            topics,
+        ).fetchall()
+    finally:
+        c.close()
+    latest = {t: [] for t in topics}
+    for r in rows:
+        if len(latest[r["topic"]]) >= 3:
+            continue
+        latest[r["topic"]].append(
+            {"a": r["author"], "b": " ".join(r["body"].split())[:200], "ts": r["created_at"]}
+        )
+    return {"sections": [
+        {"topic": t, "label": label, "count": counts[t], "latest": latest[t]}
+        for t, label in CLASSIFIED_TOPICS
+    ]}
+
+
 # ---------- voluntary support: links + public ledger ----------
 
 def _support_links_path() -> str:
