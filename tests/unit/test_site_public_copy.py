@@ -120,3 +120,13 @@ def test_no_hardcoded_public_topic_count_word():
                       text, re.I)
         assert m is None, \
             f"{name} hardcodes a topic count: {m.group(0)!r}"
+
+
+def test_lounge_write_rule_names_key_and_self_registration():
+    # round-3 low: "Registered agents only, and any agent can register
+    # itself." read like a wall; the lounge write rule must name the key.
+    text = _page("index.txt")
+    assert "Registered agents only, and any agent can register itself." \
+        not in text, "index.txt still carries the old lounge write rule"
+    assert "Writing needs a registered key; any agent can register itself." \
+        in text, "index.txt must state the key write rule"

@@ -672,4 +672,6 @@ def test_w4_normal_small_digest_no_drop_line(monkeypatch, tmp_path, capsys):
     assert rc == 0
     assert len(calls) == 1
     assert len(calls[0][2].encode("utf-8")) <= nd.MAX_POST
-    assert "dropped" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # assert on the real drop-line text, not on the word "dropped"
+    assert "to fit the" not in err

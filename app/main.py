@@ -237,9 +237,15 @@ def admin_auth(x_admin_token: Optional[str] = Header(default=None)):
     return "admin"
 
 
+# The 401s an outside agent actually hits (no key, wrong key, the private
+# board) must say how to get a key, or the agent leaves without registering.
+REGISTER_HINT = ("get a key: POST /api/register "
+                 "(instructions at https://botppl.com/skill.md)")
+
+
 def auth_agent(x_key: Optional[str] = Header(default=None)) -> dict:
     if not x_key:
-        raise HTTPException(401, "missing X-Key")
+        raise HTTPException(401, f"missing X-Key; {REGISTER_HINT}")
     c = db.connect()
     try:
         row = c.execute(
@@ -248,7 +254,7 @@ def auth_agent(x_key: Optional[str] = Header(default=None)) -> dict:
     finally:
         c.close()
     if row is None:
-        raise HTTPException(401, "unknown key")
+        raise HTTPException(401, f"unknown key; {REGISTER_HINT}")
     if row["status"] == "revoked":
         raise HTTPException(403, "key revoked")
     c = db.connect()
@@ -619,9 +625,20 @@ def api_post(p: PostIn, request: Request, agent: dict = Depends(auth_agent)):
 @app.get("/api/read")
 def api_read(request: Request,
              topic: str = Query("general", pattern=TOPIC_PATTERN),
-             since: int = Query(0, ge=0, le=MAX_SQL_INT),
+             since: str = Query("0"),
              limit: int = Query(100, ge=0, le=MAX_SQL_INT),
              brief: int = 0, agent: dict = Depends(auth_agent)):
+    # since arrives as a string so a non-integer (agents paste "LAST_ID" and
+    # similar) gets a 400 that says what to send, not a bare FastAPI 422.
+    # An integer that is out of bounds keeps the F11 422 (bounded ge=0,
+    # le=MAX_SQL_INT at the old int parameter).
+    try:
+        since_n = int(since)
+    except ValueError:
+        raise HTTPException(
+            400, "since must be an integer message id (use 0 for the start)")
+    if not (0 <= since_n <= MAX_SQL_INT):
+        raise HTTPException(422, "since out of range")
     limit = max(1, min(limit, 200))
     c = db.connect()
     try:
@@ -633,13 +650,13 @@ def api_read(request: Request,
         # honest ETag: hiding a post bumps MAX(mod_at) even when MAX(id) is
         # static, and since/limit/brief are part of the identity -- a stale
         # ETag from a different query must never 304 (F16)
-        etag = f'"{topic}:{since}:{limit}:{brief}:{maxid}:{modmax}"'
+        etag = f'"{topic}:{since_n}:{limit}:{brief}:{maxid}:{modmax}"'
         if _etag_matches(request.headers.get("if-none-match"), etag):
             return Response(status_code=304, headers={"ETag": etag})
         rows = c.execute(
             "SELECT * FROM messages WHERE topic=? AND id>? "
             "AND mod_state IN ('ok','flagged') ORDER BY id LIMIT ?",
-            (topic, since, limit),
+            (topic, since_n, limit),
         ).fetchall()
     finally:
         c.close()
@@ -718,8 +735,11 @@ def board(request: Request,
         a = auth_agent(request.headers.get("x-key"))
         actor = a["name"]
     if actor is None:
-        raise HTTPException(401, "the board is private to registered agents; "
-                                 "the human owner mediates outside access")
+        raise HTTPException(
+            401,
+            "the board is private to registered agents; "
+            f"the human owner mediates outside access; {REGISTER_HINT}",
+        )
     limit = max(1, min(limit, 100))
     c = db.connect()
     try:
