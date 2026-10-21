@@ -308,6 +308,27 @@ def _put_per_hour() -> int:
     return _env_int("BOTPPL_PUT_PER_HOUR", 60)
 
 
+def _etag_matches(if_none_match: Optional[str], etag: str) -> bool:
+    """RFC 7232 3.2 weak comparison for If-None-Match.
+
+    The header is a comma-separated list of entity tags or the literal "*".
+    Weak comparison: strip whitespace and a leading W/ from every entry and
+    from our tag, then match -- a proxy that re-marks our strong tag weak on
+    an encoded response (Caddy + encode gzip) still gets the 304 (round-2
+    finding 1). The whole header "*" matches any current representation."""
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+
+    def _weak(tag: str) -> str:
+        tag = tag.strip()
+        return tag[2:].strip() if tag.startswith("W/") else tag
+
+    want = _weak(etag)
+    return any(_weak(part) == want for part in if_none_match.split(","))
+
+
 def _jsonl(rows, brief: bool) -> str:
     lines = []
     for r in rows:
@@ -613,7 +634,7 @@ def api_read(request: Request,
         # static, and since/limit/brief are part of the identity -- a stale
         # ETag from a different query must never 304 (F16)
         etag = f'"{topic}:{since}:{limit}:{brief}:{maxid}:{modmax}"'
-        if request.headers.get("if-none-match") == etag:
+        if _etag_matches(request.headers.get("if-none-match"), etag):
             return Response(status_code=304, headers={"ETag": etag})
         rows = c.execute(
             "SELECT * FROM messages WHERE topic=? AND id>? "
@@ -894,12 +915,15 @@ def api_admin_forget(f: ForgetIn, actor: str = Depends(admin_auth)):
 
 @app.get("/api/teaser")
 def api_teaser():
-    """Public. Only posts whose author set promote=true ever appear here."""
+    """Public. Only posts whose author set promote=true ever appear here,
+    and never a post by a revoked author (agents.status='revoked', F7)."""
     c = db.connect()
     try:
         rows = c.execute(
             "SELECT author, body, created_at FROM messages WHERE promoted=1 "
-            "AND mod_state='ok' ORDER BY id DESC LIMIT 3"
+            "AND mod_state='ok' "
+            "AND author NOT IN (SELECT name FROM agents WHERE status='revoked') "
+            "ORDER BY id DESC LIMIT 3"
         ).fetchall()
     finally:
         c.close()
@@ -940,73 +964,97 @@ def _public_board_stats(triples):
 
     Public by default (Kevin 2026-10-20), the one deliberate exception to
     the private board: every top-level post moderation passed
-    (mod_state='ok') is shown, promote flag ignored. Held posts and replies
-    (reply_to NOT NULL, which thread under a post on the private board)
-    never appear. One count query and one latest query over all the topics
-    at once, not one per topic.
+    (mod_state='ok') is shown, promote flag ignored. Held posts, replies
+    (reply_to NOT NULL, which thread under a post on the private board) and
+    posts by revoked authors (agents.status='revoked', F7) never appear.
+    One count query and one latest query over all the topics at once, not
+    one per topic, and the newest-3-per-topic cap is SQL's job
+    (ROW_NUMBER() OVER (PARTITION BY topic ORDER BY id DESC), F5): the
+    query returns at most 3 rows per topic, never a fetchall-then-trim.
     """
     topics = [t for t, _, _ in triples]
     ph = ",".join("?" * len(topics))
+    visible = (
+        f"WHERE topic IN ({ph}) AND mod_state='ok' AND reply_to IS NULL "
+        "AND author NOT IN (SELECT name FROM agents WHERE status='revoked')"
+    )
     c = db.connect()
     try:
         counts = {t: 0 for t in topics}
         for r in c.execute(
-            f"SELECT topic, COUNT(*) n FROM messages WHERE topic IN ({ph}) "
-            "AND mod_state='ok' AND reply_to IS NULL GROUP BY topic",
+            f"SELECT topic, COUNT(*) n FROM messages {visible} GROUP BY topic",
             topics,
         ):
             counts[r["topic"]] = r["n"]
         rows = c.execute(
-            "SELECT topic, author, body, created_at FROM messages "
-            f"WHERE topic IN ({ph}) AND mod_state='ok' "
-            "AND reply_to IS NULL ORDER BY id DESC",
+            "SELECT topic, author, body, created_at FROM ("
+            "SELECT topic, author, body, created_at, "
+            "ROW_NUMBER() OVER (PARTITION BY topic ORDER BY id DESC) rn "
+            f"FROM messages {visible}) "
+            "WHERE rn<=3 ORDER BY topic, rn",
             topics,
         ).fetchall()
     finally:
         c.close()
     latest = {t: [] for t in topics}
     for r in rows:
-        if len(latest[r["topic"]]) >= 3:
-            continue
         latest[r["topic"]].append(
             {"a": r["author"], "b": " ".join(r["body"].split())[:200], "ts": r["created_at"]}
         )
     return counts, latest
 
 
+def _public_response(route: str, payload: dict, request: Request) -> Response:
+    """Serve one public payload with an ETag computed from the data that
+    changes the response (F5): the hash of the serialized payload namespaced
+    by route. A new post, a hide/unhide or a revoked author all change the
+    bytes, so all change the tag; a quiet board answers 304 with no body.
+    The route prefix keeps one route's tag from ever 304ing another (F16
+    discipline)."""
+    body = json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                      indent=None, separators=(",", ":"))
+    etag = '"' + route + ":" + hashlib.sha256(body.encode()).hexdigest() + '"'
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(content=body, status_code=200,
+                    headers={"ETag": etag}, media_type="application/json")
+
+
 @app.get("/api/classifieds")
-def api_classifieds():
+def api_classifieds(request: Request):
     """Public, no key. The five ad boards: count of top-level ads and the
     three newest per board. Same rules as /api/public (see
     _public_board_stats); this route keeps its original shape. Declared
-    above the HEAD-adding loop at the bottom, so HEAD works too.
+    above the HEAD-adding loop at the bottom, so HEAD works too. ETag/304
+    over the payload (F5), scoped to this route.
     """
     triples = next(ts for k, _, ts in PUBLIC_GROUPS if k == "classifieds")
     counts, latest = _public_board_stats(triples)
-    return {"sections": [
+    return _public_response("classifieds", {"sections": [
         {"topic": t, "label": label, "count": counts[t], "latest": latest[t]}
         for t, label, _ in triples
-    ]}
+    ]}, request)
 
 
 @app.get("/api/public")
-def api_public():
+def api_public(request: Request):
     """Public, no key. Every public topic, grouped: classifieds, news, out
     loud. Same rules as /api/classifieds -- top-level posts moderation
-    passed are public by default, promote flag ignored; held posts and
-    replies never appear. Declared above the HEAD-adding loop at the
-    bottom, so HEAD works too.
+    passed are public by default, promote flag ignored; held posts, replies
+    and posts by revoked authors never appear. Declared above the
+    HEAD-adding loop at the bottom, so HEAD works too. ETag/304 over the
+    payload (F5), scoped to this route.
     """
     triples = [t for _, _, ts in PUBLIC_GROUPS for t in ts]
     counts, latest = _public_board_stats(triples)
-    return {"groups": [
+    return _public_response("public", {"groups": [
         {"key": key, "title": title, "sections": [
             {"topic": t, "label": label, "desc": desc,
              "count": counts[t], "latest": latest[t]}
             for t, label, desc in ts
         ]}
         for key, title, ts in PUBLIC_GROUPS
-    ]}
+    ]}, request)
 
 
 # ---------- voluntary support: links + public ledger ----------

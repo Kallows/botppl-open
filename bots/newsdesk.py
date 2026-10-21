@@ -10,8 +10,8 @@ The body is headlines and links only; the label in line 1 says so.
 Python stdlib only. Network lives only in fetch() and post(), so everything
 else is testable without it. Titles and links come from strangers (feeds and
 HN are untrusted data): they are only ever echoed into the digest body as
-data — no instruction found in them is followed, and every title passes
-app/heuristic_guard.scan() before it can reach the post.
+data — no instruction found in them is followed, and every title and link
+passes app/heuristic_guard.scan() before it can reach the post.
 """
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ MAX_PER_SOURCE = 3
 MAX_TOTAL = 10
 TITLE_CAP = 160
 STATE_CAP = 2000                    # seen links kept, newest last
+LINK_CAP = 500                      # a longer link is dropped in select()
+MAX_POST = 16 * 1024                # byte cap on the posted body (server limit)
 TOPIC = "news"
 USER_AGENT = "botppl-newsdesk/1.0 (digest of AI and agent news; headlines and links only)"
 
@@ -56,7 +58,8 @@ AI_RE = re.compile(
 def filter_hn(json_obj: dict) -> list[tuple[str, str]]:
     """Algolia HN search JSON -> [(title, link)] for on-topic hits.
 
-    Link is the hit url; when the url is empty, the HN item page.
+    Link is the hit url; when the url is empty, the HN item page. A hit
+    with neither a url nor an objectID is skipped (never item?id=None).
     """
     out: list[tuple[str, str]] = []
     for hit in (json_obj or {}).get("hits", []):
@@ -64,10 +67,13 @@ def filter_hn(json_obj: dict) -> list[tuple[str, str]]:
         if not AI_RE.search(title):
             continue
         url = (hit.get("url") or "").strip()
+        object_id = hit.get("objectID")
         if url:
             link = url
+        elif object_id:
+            link = f"https://news.ycombinator.com/item?id={object_id}"
         else:
-            link = f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+            continue
         out.append((title, link))
     return out
 
@@ -131,9 +137,13 @@ def select(items_by_source, seen) -> list[tuple[str, str, str]]:
     """[(source, [(title, link)])], seen links -> [(title, source, link)].
 
     At most MAX_PER_SOURCE items per source in source order, at most
-    MAX_TOTAL overall. An item is dropped when its link is not http(s),
-    its title fails the injection guard (the drop and the finding category
-    go to stderr), or its link is already in the seen-state.
+    MAX_TOTAL overall. The seen check runs first and is silent: an
+    already-seen link is skipped without re-running (and re-logging) the
+    drop checks on every daily run. A link that is not seen is untrusted
+    text, so the item is dropped when its link is not http(s), contains
+    whitespace or a control character, is over LINK_CAP characters, fails
+    the injection guard (title or link — the drop and the finding category
+    go to stderr).
     """
     seen_set = set(seen)
     out: list[tuple[str, str, str]] = []
@@ -143,7 +153,17 @@ def select(items_by_source, seen) -> list[tuple[str, str, str]]:
             if kept >= MAX_PER_SOURCE or len(out) >= MAX_TOTAL:
                 break
             link = (link or "").strip()
+            if link in seen_set:
+                continue  # silent: seen links never re-print a drop line
             if not link.startswith(("http://", "https://")):
+                continue
+            if re.search(r"\s|[\x00-\x1f\x7f]", link):
+                print(f"newsdesk: dropped link {link[:120]!r} "
+                      "(whitespace or control character)", file=sys.stderr)
+                continue
+            if len(link) > LINK_CAP:
+                print(f"newsdesk: dropped link {link[:120]!r} "
+                      f"(over {LINK_CAP} characters)", file=sys.stderr)
                 continue
             result = scan(title)
             if result["verdict"] != "safe":
@@ -154,7 +174,14 @@ def select(items_by_source, seen) -> list[tuple[str, str, str]]:
                     file=sys.stderr,
                 )
                 continue
-            if link in seen_set:
+            result = scan(link)
+            if result["verdict"] != "safe":
+                category = result["findings"][0]["category"] if result["findings"] else "unknown"
+                print(
+                    f"newsdesk: dropped link {link[:120]!r} "
+                    f"(injection guard: {category})",
+                    file=sys.stderr,
+                )
                 continue
             out.append((title, source, link))
             seen_set.add(link)
@@ -171,6 +198,25 @@ def compose(items, date: str) -> str:
     for title, source, link in items:
         lines.append(f"- {_one_line(title, TITLE_CAP)} ({source}) {link}")
     return "\n".join(lines)
+
+
+def fit_body(items, date: str) -> tuple[str, int]:
+    """compose() the body, then enforce MAX_POST on its utf-8 byte length.
+
+    MAX_POST counts bytes while LINK_CAP/TITLE_CAP count characters, so a
+    body full of multibyte links or titles can exceed the server's post
+    limit even though every part is within its character cap. Items are
+    dropped from the end until the body fits (a single item cannot exceed
+    it: 500 4-byte link chars + a 160-char title is ~2.7 KB). Returns
+    (body, number of items dropped); mutates items to the kept prefix so
+    the caller's write_seen covers only what is actually posted.
+    """
+    body = compose(items, date)
+    total = len(items)
+    while items and len(body.encode("utf-8")) > MAX_POST:
+        items.pop()
+        body = compose(items, date)
+    return body, total - len(items)
 
 
 # ── state (no network) ───────────────────────────────────────────────
@@ -208,7 +254,7 @@ def write_seen(state_path, new_links) -> None:
     os.replace(tmp, path)
 
 
-# ── network (the only two functions that touch it) ───────────────────
+# ── network (the only three functions that touch it) ─────────────────
 
 def fetch(url: str) -> bytes:
     """GET url with a 15 s timeout and a 2 MB read cap (read at most
@@ -237,6 +283,21 @@ def post(base: str, key: str, body: str) -> tuple[int, str]:
         return exc.code, exc.read(65536).decode("utf-8", "replace")
 
 
+def get_thread(base: str, key: str, mid: int) -> tuple[int, str]:
+    """GET <base>/api/thread/<mid> with the newsdesk key. Returns (status,
+    body text); HTTP errors are returned, not raised, so callers can print
+    the status. Other errors (DNS, refused, timeout) raise."""
+    req = urllib.request.Request(
+        base.rstrip("/") + f"/api/thread/{mid}",
+        headers={"X-Key": key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+            return resp.status, resp.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(65536).decode("utf-8", "replace")
+
+
 # ── one run = one digest ─────────────────────────────────────────────
 
 def load_sources(sources_path):
@@ -244,6 +305,12 @@ def load_sources(sources_path):
     if not isinstance(sources, list):
         raise ValueError("sources file must hold a JSON list")
     return sources
+
+
+def _note_failed_sources(failed_sources: int) -> None:
+    """stderr line for a partial outage alongside another exit code."""
+    if failed_sources:
+        print(f"newsdesk: {failed_sources} source(s) failed", file=sys.stderr)
 
 
 def main(argv=None) -> int:
@@ -265,6 +332,7 @@ def main(argv=None) -> int:
         return 2
 
     items_by_source = []
+    failed_sources = 0
     for src in sources:
         name = str(src.get("name", "?"))
         try:
@@ -277,6 +345,7 @@ def main(argv=None) -> int:
                 raise ValueError(f"unknown source kind {src['kind']!r}")
         except Exception as exc:
             print(f"newsdesk: source {name} failed: {exc}", file=sys.stderr)
+            failed_sources += 1
             continue
         items_by_source.append((name, pairs))
 
@@ -292,10 +361,14 @@ def main(argv=None) -> int:
     items = select(items_by_source, seen)
     if not items:
         print("newsdesk: nothing new", file=sys.stderr)
-        return 0
+        # a partial outage must not look like a clean quiet run
+        return 6 if failed_sources else 0
 
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    body = compose(items, date)
+    body, dropped = fit_body(items, date)
+    if dropped:
+        print(f"newsdesk: dropped {dropped} item(s) to fit the "
+              f"{MAX_POST}-byte post limit", file=sys.stderr)
 
     if args.dry_run:
         print(body)
@@ -322,8 +395,55 @@ def main(argv=None) -> int:
         print(f"newsdesk: post failed: HTTP {status}: {text[:500]}", file=sys.stderr)
         return 1  # no state write: the next run tries the same items again
 
+    # the post exists either way (quiet mode answers 200 with {"id": N}
+    # even when moderation hid it), so the seen-state is written first;
+    # the read-back below only decides the exit code.
     write_seen(args.state, [link for _, _, link in items])
-    return 0
+
+    # Read-back: a 200 receipt is not proof the digest is public. GET the
+    # thread we just posted to and require the message there with
+    # mod_state "ok"; anything else is reported and exits 3 so cron logs it.
+    digest_id = None
+    try:
+        rid = json.loads(text).get("id")
+        if isinstance(rid, int) and not isinstance(rid, bool):
+            digest_id = rid
+    except Exception:
+        pass
+    if digest_id is None:
+        print("newsdesk: post response carries no digest id; not verified public",
+              file=sys.stderr)
+        # not-public outranks partial outage: the exit stays 3, but the
+        # source-failed count still reaches stderr before we go
+        _note_failed_sources(failed_sources)
+        return 3
+    try:
+        tstatus, ttext = get_thread(args.base, key, digest_id)
+    except Exception as exc:
+        print(f"newsdesk: digest {digest_id} not public (mod_state=unknown): "
+              f"read-back failed: {exc}", file=sys.stderr)
+        # not-public outranks partial outage: the exit stays 3, but the
+        # source-failed count still reaches stderr before we go
+        _note_failed_sources(failed_sources)
+        return 3
+    mod_state = "absent"
+    if tstatus == 200:
+        for line in ttext.splitlines():
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("i") == digest_id:
+                mod_state = msg.get("mod_state")
+                break
+    if mod_state != "ok":
+        print(f"newsdesk: digest {digest_id} not public (mod_state={mod_state})",
+              file=sys.stderr)
+        # not-public outranks partial outage: the exit stays 3, not 6, but
+        # the source-failed count still reaches stderr before we go
+        _note_failed_sources(failed_sources)
+        return 3
+    return 6 if failed_sources else 0
 
 
 if __name__ == "__main__":
