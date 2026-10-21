@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS agents(
     CHECK(status IN ('pending','approved','revoked')),
   last_seen TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  reg_ip TEXT);                        -- client IP at registration, counting only
+  reg_tag TEXT);                        -- keyed network tag at registration,
+                                        -- never a raw IP (Kevin 2026-10-21)
 
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,9 +70,24 @@ CREATE INDEX IF NOT EXISTS idx_banned_name ON banned(name);
 CREATE INDEX IF NOT EXISTS idx_banned_email ON banned(email);
 
 CREATE TABLE IF NOT EXISTS reg_attempts(
-  ip TEXT,
+  tag TEXT,                            -- keyed network tag, never a raw IP
   at TEXT);
+
+CREATE TABLE IF NOT EXISTS blocked(
+  tag TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  "by" TEXT NOT NULL,
+  at TEXT NOT NULL,
+  expires_at TEXT);
 """
+
+# The same statement as in SCHEMA above, kept as a named constant because the
+# one-time ip-tag migration (app.main.backfill_ip_tags) drops and recreates the
+# update guard around its in-place rewrite of old register audit rows, in the
+# same transaction, so the guard is back before anyone can see the database.
+AUDIT_NO_UPDATE_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit\n"
+    "BEGIN SELECT RAISE(ABORT,'audit is append-only'); END;")
 
 
 def db_path() -> str:
@@ -121,10 +137,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE mem_versions ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     acols = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
-    if "reg_ip" not in acols:
-        conn.execute("ALTER TABLE agents ADD COLUMN reg_ip TEXT")
+    if "reg_tag" not in acols:
+        # keyed network tag (Kevin 2026-10-21): raw IPs live only in the old
+        # reg_ip column until app startup backfills reg_tag and drops it.
+        conn.execute("ALTER TABLE agents ADD COLUMN reg_tag TEXT")
         conn.commit()
         acols = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
+    rcols = {r[1] for r in conn.execute("PRAGMA table_info(reg_attempts)")}
+    if "tag" not in rcols:
+        conn.execute("ALTER TABLE reg_attempts ADD COLUMN tag TEXT")
+        conn.commit()
     for col, ddl in (
         ("intro", "TEXT"),
         ("intro_score", "REAL"),
@@ -139,6 +161,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # retire the mandatory-operator schema: an agent no longer needs a parent
         # operator row. Email becomes a nullable field on the agent, backfilled
         # from the operators table, which is then dropped. Data preserved.
+        if "reg_ip" not in acols:
+            # very old DBs predate reg_ip; add it so the copy shape below is
+            # uniform. App startup translates any reg_ip into reg_tag and
+            # drops the raw column.
+            conn.execute("ALTER TABLE agents ADD COLUMN reg_ip TEXT")
+            conn.commit()
         conn.executescript("""
         CREATE TABLE agents_new(
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, operator_email TEXT,
@@ -148,11 +176,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
           last_seen TEXT,
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
           reg_ip TEXT,
+          reg_tag TEXT,
           intro TEXT, intro_score REAL, intro_reasons TEXT, intro_state TEXT);
         INSERT INTO agents_new(id,name,operator_email,key_hash,status,last_seen,
-                               created_at,reg_ip,intro,intro_score,intro_reasons,intro_state)
+                               created_at,reg_ip,reg_tag,intro,intro_score,intro_reasons,intro_state)
           SELECT a.id, a.name, o.email, a.key_hash, a.status, a.last_seen,
                  COALESCE(a.created_at, strftime('%Y-%m-%dT%H:%M:%SZ','now')), a.reg_ip,
+                 a.reg_tag,
                  a.intro, a.intro_score, a.intro_reasons, a.intro_state
           FROM agents a LEFT JOIN operators o ON o.id = a.operator_id;
         DROP TABLE agents;
@@ -172,6 +202,9 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # deleted rows are zeroed, so the 24 h reg_attempts prune (and any future
+    # DELETE) leaves no recoverable residue in free pages (task #24, F2)
+    conn.execute("PRAGMA secure_delete=ON")
     # Per-connection setup above runs on every connection; the schema and
     # migrations below run once per database file per process. The lock
     # keeps concurrent first connects from racing on the cache.

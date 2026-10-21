@@ -1,13 +1,14 @@
-"""F2 registration attempt accounting + F8 counting IP.
+"""F2 registration attempt accounting + F8 counting by keyed network tag.
 
-F2 new order: request validation -> per-IP attempt limit -> ban -> name taken
+F2 new order: request validation -> per-tag attempt limit -> ban -> name taken
 -> insert. Every attempt that reaches the limit check is counted in the new
 reg_attempts table -- successes, ban refusals and name-taken refusals -- so a
 banned email or a taken name cannot be probed without limit (ban-list oracle).
 A 429 is neither audited nor counted. Rows older than 2 days are pruned on
-insert. F8: the counted IP is request.client.host, never X-Forwarded-For
-(uvicorn's proxy-headers handling already trusts that only from Caddy on
-127.0.0.1), so a rotating header cannot open fresh buckets.
+insert. F8: the counted identity is ip_tag(request.client.host), never
+X-Forwarded-For (uvicorn's proxy-headers handling already trusts that only
+from Caddy on 127.0.0.1), so a rotating header cannot open fresh buckets.
+Task #24 phase A: the rows are keyed by tag, never by raw IP.
 
 Case table (task #16):
   BOTPPL_REG_PER_DAY=2: register a, b, c from one IP      | 200, 200, 429
@@ -101,8 +102,9 @@ def test_default_limit_five_fresh_names(client):
 
 def test_attempt_rows_pruned_after_two_days(client):
     c = db.connect()
-    c.execute("INSERT INTO reg_attempts(ip,at) VALUES('testclient',"
-              "strftime('%Y-%m-%dT%H:%M:%SZ','now','-3 days'))")
+    c.execute("INSERT INTO reg_attempts(tag,at) VALUES(?,"
+              "strftime('%Y-%m-%dT%H:%M:%SZ','now','-3 days'))",
+              ("f" * 32,))
     c.commit()
     c.close()
     assert _register(client, "agent-a").status_code == 200

@@ -9,11 +9,15 @@ append-only. Integrity failures are loud (409), never served.
 """
 import datetime
 import hashlib
+import hmac
 import html
+import ipaddress
 import json
 import os
 import re
 import secrets
+import sqlite3
+from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
@@ -40,7 +44,210 @@ RESERVED_NAMES = ("admin", "system", "botppl", "kevin", "owner", "orch",
 SUPPORT_KEYS = ("stripe_monthly", "stripe_once", "github_sponsors")
 MONTHLY_COST_USD = 25         # published running cost, shown on the support page
 
-app = FastAPI(title="botppl", docs_url=None, redoc_url=None, openapi_url=None)
+
+# ---------- keyed network tags (Kevin 2026-10-21) ----------
+# botppl never stores or logs a visitor's IP address in the clear. Limits and
+# blocks work on a keyed fingerprint: ip_tag() below. Phase B (later) adds a
+# sealed escrow copy; nothing here stores a raw address.
+
+def load_ip_tag_key() -> bytes:
+    """BOTPPL_IP_TAG_KEY: >= 32 bytes of hex. Fail loud at import/startup;
+    there is no fallback to raw IPs, ever."""
+    raw = os.environ.get("BOTPPL_IP_TAG_KEY", "")
+    if not raw:
+        raise RuntimeError(
+            "BOTPPL_IP_TAG_KEY is not set: set it to >= 32 bytes of hex before "
+            "starting botppl (limits and blocks need it; raw IPs are never stored)")
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError:
+        raise RuntimeError(
+            "BOTPPL_IP_TAG_KEY is not valid hex: set it to >= 32 bytes of hex "
+            "(raw IPs are never stored)")
+    if len(key) < 32:
+        raise RuntimeError(
+            f"BOTPPL_IP_TAG_KEY decodes to {len(key)} bytes, need >= 32 "
+            "(raw IPs are never stored)")
+    return key
+
+
+# Loaded at import: an app with a missing or weak key refuses to start.
+IP_TAG_KEY: bytes = load_ip_tag_key()
+
+
+def _normalize_addr(client: str) -> str:
+    """Network identity string for keying: IPv4 as dotted quad (IPv4-mapped
+    IPv6 unwraps to its IPv4), IPv6 as its /64 network address, so the whole
+    subnet shares one tag. A string that is not an IP literal (a test host,
+    say) is keyed as-is; it is hashed either way, never stored raw."""
+    try:
+        addr = ipaddress.ip_address(client.strip())
+    except ValueError:
+        return client.strip()
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        net = ipaddress.ip_network(f"{addr.compressed}/64", strict=False)
+        return str(net.network_address)
+    return str(addr)
+
+
+def ip_tag(client: str, key: Optional[bytes] = None) -> str:
+    """Keyed network tag: hex HMAC-SHA256 of the normalized address, first 32
+    hex chars. This is the ONLY thing app code stores or compares for limits
+    and blocks. 'unknown' (no peer address) maps to the tag 'unknown'."""
+    if not client or client == "unknown":
+        return "unknown"
+    k = IP_TAG_KEY if key is None else key
+    norm = _normalize_addr(client).encode("utf-8")
+    return hmac.new(k, norm, hashlib.sha256).hexdigest()[:32]
+
+
+# tag -> expires_at (ISO Z string) or None for a permanent block. Loaded at
+# startup and refreshed after every admin block/unblock, so the per-request
+# check is never a DB query.
+_blocked: dict[str, Optional[str]] = {}
+
+
+def load_blocked() -> None:
+    """Refresh the in-memory blocked-tag set from the DB, pruning rows whose
+    expiry has passed: an expired block can never fire again and
+    /api/admin/blocks hides it, so the table does not keep it either (F7)."""
+    global _blocked
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c = db.connect()
+    try:
+        c.execute("DELETE FROM blocked WHERE expires_at IS NOT NULL "
+                  "AND expires_at <= ?", (now,))
+        c.commit()
+        rows = c.execute("SELECT tag, expires_at FROM blocked").fetchall()
+    finally:
+        c.close()
+    _blocked = {r["tag"]: r["expires_at"] for r in rows}
+
+
+def _blocked_now(tag: str) -> bool:
+    if tag not in _blocked:
+        return False
+    exp = _blocked[tag]
+    if exp is None:
+        return True
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return exp > now
+
+
+# an old register audit line reads "... ip=<addr> ..."; the one-time migration
+# rewrites each such field to "... tag=<keyed tag> ..." (F1)
+_OLD_IP_FIELD_RE = re.compile(r"(^|\s)ip=(\S+)")
+
+
+def _tag_old_ip_fields(detail: str) -> str:
+    """'ip=<addr>' -> 'tag=<ip_tag(addr)>' inside one old audit detail. Only
+    the ip= field is replaced (whitespace-anchored, so an email or prose that
+    merely contains 'ip=' is not touched); the rest of the row text stays
+    verbatim."""
+    return _OLD_IP_FIELD_RE.sub(
+        lambda m: m.group(1) + "tag=" + ip_tag(m.group(2)), detail)
+
+
+def backfill_ip_tags() -> None:
+    """One-time migration at app startup (needs the tag key, which db.py does
+    not have): translate every stored reg_ip into reg_tag, rewrite the ip=
+    token of old audit lines -- whatever the action -- to tag= (rows kept,
+    order kept), forget the 24 h reg_attempts counters, then drop the raw
+    columns -- all in one transaction (F1). On a run that did any of that
+    work, a fresh autocommit connection then checkpoints the WAL and
+    VACUUMs, so the freed pages that held the old row images leave the file
+    and its backups (F2). Running twice is a no-op and appends no second
+    migrate row; after this no column holding a raw IP exists and no audit
+    line names one."""
+    c = db.connect()
+    did_work = False
+    try:
+        acols = {r[1] for r in c.execute("PRAGMA table_info(agents)")}
+        rcols = {r[1] for r in c.execute("PRAGMA table_info(reg_attempts)")}
+        # fetchall before any UPDATE (F5): SQLite leaves mid-scan row visits
+        # undefined when the scanned table is written to during the scan
+        agent_rows = (
+            c.execute("SELECT id, reg_ip FROM agents "
+                      "WHERE reg_ip IS NOT NULL").fetchall()
+            if "reg_ip" in acols else []
+        )
+        # EVERY audit row whose detail holds an 'ip=<addr>' token, whatever
+        # the action (live defect 2026-10-21: the old WHERE action='register'
+        # missed an action='register-ratelimited' row written by pre-#24
+        # code, so a raw IP survived in the live DB). _tag_old_ip_fields is
+        # what decides whether a detail holds a token -- 'ship='/'zip=' and
+        # an 'ip=' with no address after it stay byte-identical (F1).
+        audit_rows = c.execute("SELECT id, detail FROM audit").fetchall()
+        rewrites = []
+        for r in audit_rows:
+            new = _tag_old_ip_fields(r["detail"])
+            if new != r["detail"]:
+                rewrites.append((r["id"], new))
+        dropped_cols = "reg_ip" in acols or "ip" in rcols
+        if dropped_cols or rewrites:
+            did_work = True
+            # one explicit transaction for the whole migration: the audit
+            # rewrite below drops and recreates the append-only update guard,
+            # and DDL outside a transaction would autocommit that drop
+            c.execute("BEGIN")
+            for r in agent_rows:
+                c.execute("UPDATE agents SET reg_tag=? WHERE id=?",
+                          (ip_tag(r["reg_ip"]), r["id"]))
+            n_attempts = 0
+            if dropped_cols:
+                # the raw column existed: the 24 h counters keyed by it are void
+                n_attempts = c.execute("DELETE FROM reg_attempts").rowcount
+            if rewrites:
+                # rewrite in place -- rows kept, never deleted or reordered.
+                # The audit_no_update guard blocks exactly this; drop it for
+                # these statements only and recreate it below, in the same
+                # transaction, so a failed migration rolls the guard back into
+                # place.
+                c.execute("DROP TRIGGER IF EXISTS audit_no_update")
+                for rid, new in rewrites:
+                    c.execute("UPDATE audit SET detail=? WHERE id=?", (new, rid))
+                c.execute(db.AUDIT_NO_UPDATE_DDL)
+            if "reg_ip" in acols:
+                c.execute("ALTER TABLE agents DROP COLUMN reg_ip")
+            if "ip" in rcols:
+                c.execute("ALTER TABLE reg_attempts DROP COLUMN ip")
+            # one audit line for the migration: counts only, never an IP
+            c.execute(
+                "INSERT INTO audit(actor,action,detail) "
+                "VALUES('system','migrate-ip-tags',?)",
+                (f"agents={len(agent_rows)} audit_rows={len(rewrites)} "
+                 f"reg_attempts={n_attempts}",),
+            )
+            c.commit()
+    finally:
+        c.close()
+    # Reclaim the freed pages whenever there are any (review24-round2
+    # finding 3): this run's migration just freed some (did_work), or an
+    # earlier run committed and then died before its VACUUM left the
+    # freelist populated (PRAGMA freelist_count > 0) -- self-healing from
+    # now on instead of once-only. The checkpoint also empties the WAL of
+    # the old row images the migration replaced in place. VACUUM refuses to
+    # run inside a transaction -> fresh autocommit connection.
+    v = sqlite3.connect(db.db_path(), isolation_level=None)
+    try:
+        freelist = v.execute("PRAGMA freelist_count").fetchone()[0]
+        if did_work or freelist > 0:
+            v.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            v.execute("VACUUM")
+    finally:
+        v.close()
+    load_blocked()
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    backfill_ip_tags()
+    yield
+
+app = FastAPI(title="botppl", docs_url=None, redoc_url=None, openapi_url=None,
+              lifespan=_lifespan)
 
 
 class BodyCapMiddleware:
@@ -110,6 +317,37 @@ class BodyCapMiddleware:
 
 
 app.add_middleware(BodyCapMiddleware)
+
+
+class BlockMiddleware:
+    """Reject every request from a blocked network tag with 403
+    {"detail":"blocked"}. The tag is the keyed fingerprint (never a raw IP);
+    the blocked set is in memory (refreshed at startup and on every admin
+    block/unblock) so this is not a DB query per request.
+
+    /api/admin/* is exempt (F3): those routes already demand the admin token,
+    so the block cannot be probed from a blocked network and -- more
+    importantly -- a blocked network keeps the escape hatch of unblocking
+    itself (the admin must never be locked out of their own admin API)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if not scope.get("path", "").startswith("/api/admin/"):
+            peer = scope.get("client")
+            host = (peer[0] if peer else None) or "unknown"
+            if _blocked_now(ip_tag(host)):
+                await JSONResponse({"detail": "blocked"}, status_code=403)(
+                    scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(BlockMiddleware)
 
 
 class RegisterIn(BaseModel):
@@ -196,6 +434,35 @@ class BanIn(BaseModel):
         return v
 
 
+class BlockIn(BaseModel):
+    # exactly one of agent/tag names the network tag to block; reason is
+    # required; days turns the block into a temporary one (expires_at set).
+    # tag must be what ip_tag() produces -- 32 lowercase hex chars -- so an
+    # admin-typed IP address or a blank is refused (422) instead of being
+    # stored raw in blocked.tag and the audit line (F4)
+    agent: Optional[str] = None
+    tag: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    reason: str = Field(min_length=1)
+    days: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reason must be non-empty")
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_of(self):
+        if (self.agent is None) == (self.tag is None):
+            raise ValueError("exactly one of agent or tag")
+        return self
+
+
+class UnblockIn(BaseModel):
+    tag: str = Field(min_length=1)
+
+
 class LedgerIn(BaseModel):
     entry_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     kind: str = Field(pattern=r"^(money|work|cost)$")
@@ -278,12 +545,13 @@ def require_not_revoked(agent: dict) -> None:
 
 
 def _client_ip(request: Request) -> str:
-    """Counting-only client IP: the direct peer (request.client.host), else
-    "unknown". Never X-Forwarded-For: uvicorn's proxy-headers handling already
-    resolves that header only when it comes from a trusted proxy (Caddy on
-    127.0.0.1), so the peer address is the client for counting purposes and a
-    forged header cannot mint fresh rate-limit buckets. Never trusted for
-    anything but counting."""
+    """The one source of the peer address: the direct peer
+    (request.client.host), else "unknown". Never X-Forwarded-For: uvicorn's
+    proxy-headers handling already resolves that header only when it comes
+    from a trusted proxy (Caddy on 127.0.0.1), so the peer address is the
+    client and a forged header cannot mint fresh rate-limit buckets. No
+    caller stores or compares this string: every caller stores or compares
+    ip_tag(...) only (Kevin 2026-10-21: raw IPs never stored or logged)."""
     if request.client is not None and request.client.host:
         return request.client.host
     return "unknown"
@@ -356,7 +624,7 @@ def _jsonl(rows, brief: bool) -> str:
 
 @app.post("/api/register")
 def api_register(reg: RegisterIn, request: Request):
-    ip = _client_ip(request)
+    tag = ip_tag(_client_ip(request))
     reg_per_day = _reg_per_day()
     try:
         rules = moderation.load_rules()
@@ -367,22 +635,22 @@ def api_register(reg: RegisterIn, request: Request):
     verdict = moderation.assess(reg.intro, rules)
     c = db.connect()
     try:
-        # F2: per-IP attempt limit FIRST, counting every attempt that reaches
-        # this check -- successes, ban refusals and name-taken refusals -- so a
-        # banned email or taken name cannot be probed without limit. A 429 adds
-        # no attempt row and writes no audit row.
+        # F2: per-tag (was per-IP) attempt limit FIRST, counting every attempt
+        # that reaches this check -- successes, ban refusals and name-taken
+        # refusals -- so a banned email or taken name cannot be probed without
+        # limit. A 429 adds no attempt row and writes no audit row.
         n = c.execute(
-            "SELECT COUNT(*) n FROM reg_attempts WHERE ip=? "
+            "SELECT COUNT(*) n FROM reg_attempts WHERE tag=? "
             "AND at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day')",
-            (ip,),
+            (tag,),
         ).fetchone()["n"]
         if n >= reg_per_day:
             raise HTTPException(429, "too many registrations from this address today")
         c.execute("DELETE FROM reg_attempts WHERE at < "
                   "strftime('%Y-%m-%dT%H:%M:%SZ','now','-2 days')")
         c.execute(
-            "INSERT INTO reg_attempts(ip,at) VALUES(?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-            (ip,),
+            "INSERT INTO reg_attempts(tag,at) VALUES(?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            (tag,),
         )
         c.commit()
         if db.is_banned(c, reg.agent_name, reg.operator_email):
@@ -393,14 +661,14 @@ def api_register(reg: RegisterIn, request: Request):
             raise HTTPException(409, "agent name taken")
         key = secrets.token_urlsafe(32)
         c.execute(
-            "INSERT INTO agents(name,operator_email,key_hash,reg_ip,"
+            "INSERT INTO agents(name,operator_email,key_hash,reg_tag,"
             "intro,intro_score,intro_reasons,intro_state) VALUES(?,?,?,?,?,?,?,?)",
-            (reg.agent_name, reg.operator_email, db.hash_key(key), ip,
+            (reg.agent_name, reg.operator_email, db.hash_key(key), tag,
              reg.intro, verdict["score"], json.dumps(verdict["reasons"]),
              verdict["state"]),
         )
         db.audit(c, "system", "register",
-                 f"agent={reg.agent_name} email={reg.operator_email or '(none)'} ip={ip}"
+                 f"agent={reg.agent_name} email={reg.operator_email or '(none)'} tag={tag}"
                  f" intro_state={verdict['state']} score={verdict['score']}")
         c.commit()
     finally:
@@ -463,7 +731,6 @@ def api_admin_pending(actor: str = Depends(admin_auth)):
         d["reads"] = 1 if d["last_seen"] is not None else 0
         out.append(d)
     return {"pending": out}
-
 
 MOD_ACTION_STATES = {"flag": "flagged", "hide": "hidden",
                      "remove": "removed", "unhide": "ok"}
@@ -537,6 +804,97 @@ def api_admin_ban(b: BanIn, actor: str = Depends(admin_auth)):
     finally:
         c.close()
     return {"agent": b.agent, "status": "revoked", "banned": True}
+
+
+def _block_row(c, tag: str):
+    return c.execute(
+        "SELECT tag, reason, \"by\", at, expires_at FROM blocked WHERE tag=?",
+        (tag,),
+    ).fetchone()
+
+
+@app.post("/api/admin/block")
+def api_admin_block(b: BlockIn, actor: str = Depends(admin_auth)):
+    """Block a network tag outright, or the reg_tag of a named agent (404 if
+    that agent has no reg_tag). reason is required; days makes it temporary.
+    The audit line carries who/tag/reason/expires_at (ISO, or 'never') --
+    never an IP. A tag that is not
+    32 hex chars is refused at the model (422); 'unknown' is refused on the
+    agent path too (409): blocking it would block every request without a
+    peer address (F4)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at = ((now + datetime.timedelta(days=b.days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                  if b.days else None)
+    c = db.connect()
+    try:
+        tag = b.tag
+        name = None
+        if b.agent is not None:
+            row = c.execute(
+                "SELECT name, reg_tag FROM agents WHERE name=?", (b.agent,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "no such agent")
+            if not row["reg_tag"]:
+                raise HTTPException(404, "agent has no network tag")
+            tag, name = row["reg_tag"], row["name"]
+            if not re.fullmatch(r"[0-9a-f]{32}", tag):
+                # 'unknown' is the tag of every request without a peer
+                # address: blocking it would block them all
+                raise HTTPException(
+                    409,
+                    f"agent {name} has no blockable network tag "
+                    f"(reg_tag={tag!r}); an agent tagged 'unknown' matches "
+                    "every request without a peer address and cannot be "
+                    "blocked")
+        c.execute(
+            "INSERT INTO blocked(tag,reason,\"by\",at,expires_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(tag) DO UPDATE SET reason=excluded.reason, "
+            "\"by\"=excluded.\"by\", at=excluded.at, expires_at=excluded.expires_at",
+            (tag, b.reason, actor, at, expires_at),
+        )
+        who = f"agent={name} " if name else ""
+        db.audit(c, actor, "block",
+                 f"{who}tag={tag} reason={b.reason} "
+                 f"expires_at={expires_at or 'never'}")
+        c.commit()
+    finally:
+        c.close()
+    load_blocked()
+    return {"tag": tag, "blocked": True, "expires_at": expires_at}
+
+
+@app.post("/api/admin/unblock")
+def api_admin_unblock(u: UnblockIn, actor: str = Depends(admin_auth)):
+    c = db.connect()
+    try:
+        if not _block_row(c, u.tag):
+            raise HTTPException(404, "no such block")
+        c.execute("DELETE FROM blocked WHERE tag=?", (u.tag,))
+        db.audit(c, actor, "unblock", f"tag={u.tag}")
+        c.commit()
+    finally:
+        c.close()
+    load_blocked()
+    return {"tag": u.tag, "blocked": False}
+
+
+@app.get("/api/admin/blocks")
+def api_admin_blocks(actor: str = Depends(admin_auth)):
+    """Live blocks only: an expired row is not listed (F7) and is pruned from
+    the table at the next refresh (load_blocked)."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c = db.connect()
+    try:
+        rows = c.execute(
+            "SELECT tag, reason, \"by\", at, expires_at FROM blocked "
+            "WHERE expires_at IS NULL OR expires_at > ? ORDER BY at, tag",
+            (now,),
+        ).fetchall()
+    finally:
+        c.close()
+    return {"blocks": [dict(r) for r in rows]}
 
 
 @app.get("/api/admin/audit")
@@ -729,7 +1087,12 @@ def board(request: Request,
     # Private to registered agents; the human owner (admin token) mediates access.
     actor = None
     tok = request.headers.get("x-admin-token")
-    if tok is not None and os.environ.get("ADMIN_TOKEN") and _admin_token_ok(tok):
+    if tok is not None:
+        # a present admin token is all-or-nothing (mirrors admin_auth): a bad
+        # one is 401 "bad admin token" before any X-Key branch, never a fall
+        # through to agent auth (review #23 finding)
+        if not _admin_token_ok(tok):
+            raise HTTPException(401, "bad admin token")
         actor = "admin"
     elif request.headers.get("x-key"):
         a = auth_agent(request.headers.get("x-key"))

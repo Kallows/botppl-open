@@ -1,4 +1,4 @@
-"""Integration tests for M1.5: per-key post rate limit and per-IP registration
+"""Integration tests for M1.5: per-key post rate limit and per-tag registration
 limit. Reuses the client/register/approve helpers from test_moderation.py.
 
 Limits are read from env at request time, so monkeypatch.setenv works on the
@@ -82,9 +82,14 @@ def test_misconfigured_post_limit_503(client, monkeypatch):
     assert "rate limit misconfigured" in r.text
 
 
-def test_registration_per_ip_limit(client, monkeypatch):
-    # F8: the counted IP is the direct peer ("testclient"), never
-    # X-Forwarded-For, so headers cannot split the bucket.
+def test_registration_per_tag_limit(client, monkeypatch):
+    # T5 (task #24 phase A): the registration limit counts by keyed network
+    # tag, same numbers and same 429 as the old per-IP limit. Adapted from
+    # the old test_registration_per_ip_limit (which asserted reg_ip).
+    from fastapi.testclient import TestClient
+
+    from app.main import app, ip_tag
+
     monkeypatch.setenv("BOTPPL_REG_PER_DAY", "2")
     xff = {"X-Forwarded-For": "203.0.113.9"}
     r1 = client.post("/api/register",
@@ -103,7 +108,7 @@ def test_registration_per_ip_limit(client, monkeypatch):
                      headers=xff)
     assert r3.status_code == 429, r3.text
     assert "too many registrations" in r3.text
-    rows = _rows("SELECT id FROM agents WHERE reg_ip='testclient'")
+    rows = _rows("SELECT id FROM agents WHERE reg_tag=?", (ip_tag("testclient"),))
     assert len(rows) == 2
     # F2: a 429 is not audited (and adds no attempt row)
     audits = _rows("SELECT id FROM audit WHERE action='register-ratelimited'")
@@ -114,26 +119,36 @@ def test_registration_per_ip_limit(client, monkeypatch):
                            "intro": CLEAN_INTRO},
                      headers={"X-Forwarded-For": "203.0.113.10"})
     assert r4.status_code == 429, r4.text
+    # T5: a second network address still has its own budget
+    other = TestClient(app, client=("198.51.100.9", 50000))
+    r5 = other.post("/api/register",
+                    json={"agent_name": "agent-e", "operator_email": "e@x.com",
+                          "intro": CLEAN_INTRO})
+    assert r5.status_code == 200, r5.text
 
 
 def test_registration_no_forwarded_header(client):
+    from app.main import ip_tag
+
     r = client.post("/api/register", json={"agent_name": "agent-a", "intro": CLEAN_INTRO})
     assert r.status_code == 200, r.text
-    rows = _rows("SELECT reg_ip FROM agents WHERE name='agent-a'")
+    rows = _rows("SELECT reg_tag FROM agents WHERE name='agent-a'")
     assert len(rows) == 1
-    assert rows[0]["reg_ip"] == "testclient", "Starlette's TestClient host"
+    assert rows[0]["reg_tag"] == ip_tag("testclient"), "Starlette's TestClient host"
 
 
 def test_registration_forwarded_header_ignored(client):
-    # F8: X-Forwarded-For is never the counted IP (was: takes the first entry)
+    # F8: X-Forwarded-For is never the counted address (was: takes the first entry)
+    from app.main import ip_tag
+
     r = client.post(
         "/api/register",
         json={"agent_name": "agent-a", "intro": CLEAN_INTRO},
         headers={"X-Forwarded-For": "198.51.100.7, 10.0.0.1"},
     )
     assert r.status_code == 200, r.text
-    rows = _rows("SELECT reg_ip FROM agents WHERE name='agent-a'")
-    assert rows[0]["reg_ip"] == "testclient"
+    rows = _rows("SELECT reg_tag FROM agents WHERE name='agent-a'")
+    assert rows[0]["reg_tag"] == ip_tag("testclient")
 
 
 def test_default_post_limit_is_30(client, monkeypatch):
